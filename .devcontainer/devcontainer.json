@@ -1,0 +1,31 @@
+{
+  "name": "emblem-bet Anchor Dev",
+  "image": "projectserum/anchor:0.29.0",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "20"
+    }
+  },
+  "postCreateCommand": "bash .devcontainer/setup.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "serayuzgur.crates",
+        "tamasfe.even-better-toml",
+        "esbenp.prettier-vscode"
+      ],
+      "settings": {
+        "rust-analyzer.cargo.features": "all",
+        "editor.formatOnSave": true
+      }
+    }
+  },
+  "remoteEnv": {
+    "ANCHOR_WALLET": "/root/.config/solana/id.json",
+    "ANCHOR_PROVIDER_URL": "https://api.devnet.solana.com"
+  },
+  "forwardPorts": [],
+  "mounts": [],
+  "runArgs": ["--cap-add=SYS_PTRACE", "--security-opt", "seccomp=unconfined"]
+}
