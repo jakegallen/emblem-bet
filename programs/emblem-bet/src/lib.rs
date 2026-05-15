@@ -196,7 +196,7 @@ pub mod emblem_bet {
         bet.player = ctx.accounts.player.key();
         bet.amount = amount;
         bet.win_chance_bps = win_chance_bps;
-        bet.direction = direction;
+        bet.direction = direction.clone();
         bet.client_seed = client_seed;
         bet.server_seed_hash = server_seed_hash;
         bet.nonce = nonce;
