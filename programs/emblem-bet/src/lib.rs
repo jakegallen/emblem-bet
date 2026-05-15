@@ -74,105 +74,6 @@ pub mod emblem_bet {
         Ok(())
     }
 
-    /// Migration helper: closes an old-format GameConfig so it can be re-initialized.
-    /// Reads admin from raw bytes (offset 8-39) so it works regardless of layout version.
-    pub fn close_config(ctx: Context<CloseConfig>) -> Result<()> {
-        // Verify admin from raw bytes (offset 8..40 is admin in both old and new layout)
-        let stored_admin = {
-            let data = ctx.accounts.game_config.data.borrow();
-            require!(data.len() >= 40, EmblemBetError::Unauthorized);
-            Pubkey::try_from(&data[8..40]).map_err(|_| EmblemBetError::Unauthorized)?
-        };
-        require!(ctx.accounts.admin.key() == stored_admin, EmblemBetError::Unauthorized);
-
-        // Close: drain lamports to admin
-        let lamports = ctx.accounts.game_config.lamports();
-        **ctx.accounts.game_config.lamports.borrow_mut() = 0;
-        **ctx.accounts.admin.lamports.borrow_mut() = ctx.accounts.admin.lamports()
-            .checked_add(lamports)
-            .ok_or(EmblemBetError::Unauthorized)?;
-
-        // Zero the data (prevents account resurrection)
-        let mut data = ctx.accounts.game_config.data.borrow_mut();
-        for b in data.iter_mut() { *b = 0; }
-
-        Ok(())
-    }
-
-    /// Migration helper: creates or repairs the game_config PDA.
-    ///
-    /// After close_config zeroes lamports, the Solana runtime GCs the account and resets
-    /// its owner to the system program. `realloc` cannot resize a system-owned account from
-    /// our program, so we use `system_program::create_account` via CPI with PDA signer seeds.
-    ///
-    /// This fully replaces Initialize for the migration path. Call init_house_vault next
-    /// to create the house vault token account if it doesn't exist yet.
-    pub fn repair_config(
-        ctx: Context<RepairConfig>,
-        emblem_mint: Pubkey,
-        house_edge_bps: u16,
-    ) -> Result<()> {
-        require!(
-            house_edge_bps >= MIN_HOUSE_EDGE_BPS && house_edge_bps <= MAX_HOUSE_EDGE_BPS,
-            EmblemBetError::InvalidHouseEdge
-        );
-
-        let bump = ctx.bumps.game_config;
-
-        // Compute house_vault PDA address and canonical bump
-        let (house_vault_pda, house_vault_bump) =
-            Pubkey::find_program_address(&[HOUSE_VAULT_SEED], ctx.program_id);
-
-        let space = GameConfig::SIZE;
-        let rent = Rent::get()?;
-        let required_lamports = rent.minimum_balance(space);
-
-        // Create the game_config account via system_program CPI.
-        // The PDA signs using invoke_signed with [GAME_CONFIG_SEED, bump].
-        let create_ix = anchor_lang::solana_program::system_instruction::create_account(
-            ctx.accounts.admin.key,
-            ctx.accounts.game_config.key,
-            required_lamports,
-            space as u64,
-            ctx.program_id,
-        );
-        anchor_lang::solana_program::program::invoke_signed(
-            &create_ix,
-            &[
-                ctx.accounts.admin.to_account_info(),
-                ctx.accounts.game_config.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-            ],
-            &[&[GAME_CONFIG_SEED, &[bump]]],
-        )?;
-
-        // Write all GameConfig fields directly into account data
-        let admin_key = ctx.accounts.admin.key();
-        let mut data = ctx.accounts.game_config.try_borrow_mut_data()?;
-
-        // Anchor account discriminator: sha256("account:GameConfig")[0:8]
-        data[0..8].copy_from_slice(&[45u8, 146, 146, 33, 170, 69, 96, 133]);
-        // admin (offset 8..40)
-        data[8..40].copy_from_slice(admin_key.as_ref());
-        // settle_authority = admin initially (offset 40..72); update via set_settle_authority
-        data[40..72].copy_from_slice(admin_key.as_ref());
-        // pending_admin = Pubkey::default() (offset 72..104) — zero-initialized by create_account
-        // emblem_mint (offset 104..136)
-        data[104..136].copy_from_slice(emblem_mint.as_ref());
-        // house_vault PDA address (offset 136..168)
-        data[136..168].copy_from_slice(house_vault_pda.as_ref());
-        // house_edge_bps little-endian (offset 168..170)
-        data[168..170].copy_from_slice(&house_edge_bps.to_le_bytes());
-        // paused: false (offset 170) — zero from create_account
-        // bump (offset 171)
-        data[171] = bump;
-        // house_vault_bump (offset 172)
-        data[172] = house_vault_bump;
-        // _padding (173..176), totals (176..200) — zero from create_account
-
-        Ok(())
-    }
-
     /// Migration helper: creates the house_vault token account if it doesn't exist.
     /// Called after repair_config when Initialize was never able to run cleanly.
     pub fn init_house_vault(ctx: Context<InitHouseVault>) -> Result<()> {
@@ -348,6 +249,7 @@ pub mod emblem_bet {
         bet.player = ctx.accounts.player.key();
         bet.amount = amount;
         bet.win_chance_bps = win_chance_bps;
+        bet.house_edge_bps = ctx.accounts.game_config.house_edge_bps;
         bet.direction = direction.clone();
         bet.client_seed = client_seed;
         bet.server_seed_hash = server_seed_hash;
@@ -407,7 +309,7 @@ pub mod emblem_bet {
         };
 
         // ── Step 4: Calculate payout ───────────────────────────────────────────
-        let house_edge_bps = ctx.accounts.game_config.house_edge_bps as u64;
+        let house_edge_bps = ctx.accounts.bet_request.house_edge_bps as u64;
         let payout = if won {
             bet.amount
                 .checked_mul(10_000u64.checked_sub(house_edge_bps).ok_or(EmblemBetError::Overflow)?)
@@ -548,7 +450,7 @@ pub mod emblem_bet {
         emit!(HouseFunded {
             admin: ctx.accounts.admin.key(),
             amount,
-            new_balance: ctx.accounts.house_vault.amount.checked_add(amount).unwrap_or(u64::MAX),
+            new_balance: ctx.accounts.house_vault.amount.checked_add(amount).ok_or(EmblemBetError::Overflow)?,
         });
 
         Ok(())
@@ -655,37 +557,6 @@ pub struct Initialize<'info> {
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
-}
-
-#[derive(Accounts)]
-pub struct CloseConfig<'info> {
-    #[account(mut)]
-    pub admin: Signer<'info>,
-
-    /// CHECK: Admin verified manually in instruction body; PDA verified by seeds.
-    #[account(
-        mut,
-        seeds = [GAME_CONFIG_SEED],
-        bump,
-    )]
-    pub game_config: UncheckedAccount<'info>,
-}
-
-#[derive(Accounts)]
-pub struct RepairConfig<'info> {
-    #[account(mut)]
-    pub admin: Signer<'info>,
-
-    /// CHECK: Zombie game_config — bypassing Anchor deserialization to repair directly.
-    /// PDA seeds verified by Anchor; signer acts as new admin.
-    #[account(
-        mut,
-        seeds = [GAME_CONFIG_SEED],
-        bump,
-    )]
-    pub game_config: UncheckedAccount<'info>,
-
-    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -1128,9 +999,10 @@ pub struct BetRequest {
     pub player: Pubkey,             // 32
     pub amount: u64,                // 8
     pub win_chance_bps: u16,        // 2
+    pub house_edge_bps: u16,        // 2 — snapshot from game_config at bet time
     pub direction: BetDirection,    // 1
     pub bump: u8,                   // 1
-    pub _padding: [u8; 4],          // 4 (alignment)
+    pub _padding: [u8; 2],          // 2 (alignment)
     pub nonce: u64,                 // 8
     pub slot: u64,                  // 8
     pub client_seed: [u8; 32],      // 32
@@ -1138,7 +1010,7 @@ pub struct BetRequest {
 }
 
 impl BetRequest {
-    pub const SIZE: usize = 8 + 32 + 8 + 2 + 1 + 1 + 4 + 8 + 8 + 32 + 32;
+    pub const SIZE: usize = 8 + 32 + 8 + 2 + 2 + 1 + 1 + 2 + 8 + 8 + 32 + 32;
 }
 
 // ─── Enums ────────────────────────────────────────────────────────────────────
@@ -1289,6 +1161,9 @@ fn compute_roll(server_seed: &[u8; 32], message: &[u8]) -> u64 {
     let outer = hashv(&[&opad, &inner]).to_bytes();
     // Take first 8 bytes as big-endian u64, mod ROLL_RANGE
     let int_val = u64::from_be_bytes(outer[..8].try_into().unwrap());
+    // Known minor bias (MED-6): modulo introduces bias of ~(u64::MAX % ROLL_RANGE) / u64::MAX ≈ 8.76e-17.
+    // This is negligible for practical fairness and rejection sampling would require rehashing,
+    // adding compute cost. Accepted as a known, documented limitation.
     int_val % ROLL_RANGE
 }
 
