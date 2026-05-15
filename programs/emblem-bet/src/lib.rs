@@ -474,6 +474,12 @@ pub struct Deposit<'info> {
     )]
     pub game_config: Account<'info, GameConfig>,
 
+    /// The EMBLEM mint — must match what's stored in game_config.
+    #[account(
+        constraint = emblem_mint.key() == game_config.emblem_mint @ EmblemBetError::InvalidMint,
+    )]
+    pub emblem_mint: Account<'info, Mint>,
+
     #[account(
         init_if_needed,
         payer = player,
@@ -487,7 +493,7 @@ pub struct Deposit<'info> {
     #[account(
         init_if_needed,
         payer = player,
-        token::mint = game_config.emblem_mint,
+        token::mint = emblem_mint,
         token::authority = player_vault,
         seeds = [PLAYER_VAULT_SEED, player.key().as_ref()],
         bump
