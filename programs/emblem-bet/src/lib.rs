@@ -194,6 +194,34 @@ pub mod emblem_bet {
         Ok(())
     }
 
+    /// Admin: update the emblem mint stored in game_config.
+    /// Use before close_house_vault + init_house_vault when switching to a new mint.
+    pub fn set_emblem_mint(
+        ctx: Context<SetEmblemMint>,
+        new_mint: Pubkey,
+    ) -> Result<()> {
+        ctx.accounts.game_config.emblem_mint = new_mint;
+        Ok(())
+    }
+
+    /// Admin: close the house_vault token account so it can be recreated with a new mint.
+    /// The house_vault PDA is its own token account authority, so we sign with PDA seeds.
+    /// Token balance must be zero before calling this.
+    pub fn close_house_vault(ctx: Context<CloseHouseVault>) -> Result<()> {
+        let bump = ctx.accounts.game_config.house_vault_bump;
+        let cpi_accounts = token::CloseAccount {
+            account: ctx.accounts.house_vault.to_account_info(),
+            destination: ctx.accounts.admin.to_account_info(),
+            authority: ctx.accounts.house_vault.to_account_info(),
+        };
+        token::close_account(CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+            &[&[HOUSE_VAULT_SEED, &[bump]]],
+        ))?;
+        Ok(())
+    }
+
     /// Player deposits EMBLEM into their personal vault PDA.
     /// Creates the PlayerState account if it doesn't exist yet.
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
@@ -709,6 +737,45 @@ pub struct SetSettleAuthority<'info> {
         bump = game_config.bump,
     )]
     pub game_config: Account<'info, GameConfig>,
+}
+
+#[derive(Accounts)]
+pub struct SetEmblemMint<'info> {
+    #[account(
+        constraint = admin.key() == game_config.admin @ EmblemBetError::Unauthorized
+    )]
+    pub admin: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [GAME_CONFIG_SEED],
+        bump = game_config.bump,
+    )]
+    pub game_config: Account<'info, GameConfig>,
+}
+
+#[derive(Accounts)]
+pub struct CloseHouseVault<'info> {
+    #[account(
+        mut,
+        constraint = admin.key() == game_config.admin @ EmblemBetError::Unauthorized
+    )]
+    pub admin: Signer<'info>,
+
+    #[account(
+        seeds = [GAME_CONFIG_SEED],
+        bump = game_config.bump,
+    )]
+    pub game_config: Account<'info, GameConfig>,
+
+    #[account(
+        mut,
+        seeds = [HOUSE_VAULT_SEED],
+        bump = game_config.house_vault_bump,
+    )]
+    pub house_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
