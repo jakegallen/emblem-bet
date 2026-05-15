@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 use solana_program::hash::hashv;
 
-declare_id!("CD7Qga3ENVhH2ostcfwq7HCux2BHrs2eqcapn66dsMGy");
+declare_id!("HwxAuj8mBMXr2pxbPybJ2SjJLtPHDhC7xRkZzs5FX4sr");
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
