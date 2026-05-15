@@ -99,11 +99,14 @@ pub mod emblem_bet {
         Ok(())
     }
 
-    /// Migration helper: repairs a zombie game_config (0 lamports, zeroed data, program-owned).
-    /// Called when close_config succeeded but the runtime GC left the account in a limbo state
-    /// where Initialize still fails with "account already in use".
-    /// This instruction bypasses normal Anchor validation, reallocates, funds, and writes
-    /// all GameConfig fields directly — fully replacing Initialize for the migration case.
+    /// Migration helper: creates or repairs the game_config PDA.
+    ///
+    /// After close_config zeroes lamports, the Solana runtime GCs the account and resets
+    /// its owner to the system program. `realloc` cannot resize a system-owned account from
+    /// our program, so we use `system_program::create_account` via CPI with PDA signer seeds.
+    ///
+    /// This fully replaces Initialize for the migration path. Call init_house_vault next
+    /// to create the house vault token account if it doesn't exist yet.
     pub fn repair_config(
         ctx: Context<RepairConfig>,
         emblem_mint: Pubkey,
@@ -120,30 +123,30 @@ pub mod emblem_bet {
         let (house_vault_pda, house_vault_bump) =
             Pubkey::find_program_address(&[HOUSE_VAULT_SEED], ctx.program_id);
 
-        // Step 1: Realloc to GameConfig::SIZE (200 bytes), zero-filling any expansion
-        ctx.accounts.game_config.realloc(GameConfig::SIZE, true)?;
-
-        // Step 2: Fund to rent-exempt via system_program CPI (admin → game_config)
+        let space = GameConfig::SIZE;
         let rent = Rent::get()?;
-        let min_lamports = rent.minimum_balance(GameConfig::SIZE);
-        let current_lamports = ctx.accounts.game_config.lamports();
-        if current_lamports < min_lamports {
-            let deficit = min_lamports
-                .checked_sub(current_lamports)
-                .ok_or(EmblemBetError::Overflow)?;
-            anchor_lang::system_program::transfer(
-                CpiContext::new(
-                    ctx.accounts.system_program.to_account_info(),
-                    anchor_lang::system_program::Transfer {
-                        from: ctx.accounts.admin.to_account_info(),
-                        to: ctx.accounts.game_config.to_account_info(),
-                    },
-                ),
-                deficit,
-            )?;
-        }
+        let required_lamports = rent.minimum_balance(space);
 
-        // Step 3: Write all GameConfig fields directly into account data
+        // Create the game_config account via system_program CPI.
+        // The PDA signs using invoke_signed with [GAME_CONFIG_SEED, bump].
+        let create_ix = anchor_lang::solana_program::system_instruction::create_account(
+            ctx.accounts.admin.key,
+            ctx.accounts.game_config.key,
+            required_lamports,
+            space as u64,
+            ctx.program_id,
+        );
+        anchor_lang::solana_program::program::invoke_signed(
+            &create_ix,
+            &[
+                ctx.accounts.admin.to_account_info(),
+                ctx.accounts.game_config.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+            &[&[GAME_CONFIG_SEED, &[bump]]],
+        )?;
+
+        // Write all GameConfig fields directly into account data
         let admin_key = ctx.accounts.admin.key();
         let mut data = ctx.accounts.game_config.try_borrow_mut_data()?;
 
@@ -151,23 +154,30 @@ pub mod emblem_bet {
         data[0..8].copy_from_slice(&[45u8, 146, 146, 33, 170, 69, 96, 133]);
         // admin (offset 8..40)
         data[8..40].copy_from_slice(admin_key.as_ref());
-        // settle_authority = admin initially (offset 40..72); set via set_settle_authority
+        // settle_authority = admin initially (offset 40..72); update via set_settle_authority
         data[40..72].copy_from_slice(admin_key.as_ref());
-        // pending_admin = Pubkey::default() (offset 72..104) — zeroed by realloc
+        // pending_admin = Pubkey::default() (offset 72..104) — zero-initialized by create_account
         // emblem_mint (offset 104..136)
         data[104..136].copy_from_slice(emblem_mint.as_ref());
         // house_vault PDA address (offset 136..168)
         data[136..168].copy_from_slice(house_vault_pda.as_ref());
         // house_edge_bps little-endian (offset 168..170)
         data[168..170].copy_from_slice(&house_edge_bps.to_le_bytes());
-        // paused: false (offset 170) — zeroed by realloc
+        // paused: false (offset 170) — zero from create_account
         // bump (offset 171)
         data[171] = bump;
         // house_vault_bump (offset 172)
         data[172] = house_vault_bump;
-        // _padding (173..176), total_wagered (176..184), total_paid_out (184..192),
-        // total_bets (192..200) — all zeroed by realloc
+        // _padding (173..176), totals (176..200) — zero from create_account
 
+        Ok(())
+    }
+
+    /// Migration helper: creates the house_vault token account if it doesn't exist.
+    /// Called after repair_config when Initialize was never able to run cleanly.
+    pub fn init_house_vault(ctx: Context<InitHouseVault>) -> Result<()> {
+        // house_vault is created by Anchor's init_if_needed constraint.
+        // Nothing else to do — the token account is now owned by the house_vault PDA.
         Ok(())
     }
 
@@ -648,6 +658,42 @@ pub struct RepairConfig<'info> {
     pub game_config: UncheckedAccount<'info>,
 
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct InitHouseVault<'info> {
+    #[account(
+        mut,
+        constraint = admin.key() == game_config.admin @ EmblemBetError::Unauthorized
+    )]
+    pub admin: Signer<'info>,
+
+    #[account(
+        seeds = [GAME_CONFIG_SEED],
+        bump = game_config.bump,
+    )]
+    pub game_config: Account<'info, GameConfig>,
+
+    /// The EMBLEM mint stored in game_config.
+    #[account(
+        constraint = emblem_mint.key() == game_config.emblem_mint @ EmblemBetError::InvalidMint
+    )]
+    pub emblem_mint: Account<'info, Mint>,
+
+    /// House vault token account — created if it doesn't exist yet.
+    #[account(
+        init_if_needed,
+        payer = admin,
+        token::mint = emblem_mint,
+        token::authority = house_vault,
+        seeds = [HOUSE_VAULT_SEED],
+        bump
+    )]
+    pub house_vault: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]
