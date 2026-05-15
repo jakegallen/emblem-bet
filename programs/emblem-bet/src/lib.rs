@@ -1,7 +1,6 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use solana_program::hash::hashv;
 
 declare_id!("EmbLBetXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
 
@@ -883,24 +882,30 @@ pub enum EmblemBetError {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/// SHA-256 hash of a byte slice. Used to verify server seed commitment.
+/// SHA-256 hash using Solana's built-in hashv.
 fn sha256_hash(data: &[u8]) -> [u8; 32] {
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(data);
-    hasher.finalize().into()
+    hashv(&[data]).to_bytes()
 }
 
-/// Compute roll result from HMAC-SHA256(server_seed, message) mod ROLL_RANGE.
-/// Returns a value in [0, ROLL_RANGE - 1] (i.e. 0–9999).
+/// HMAC-SHA256 implemented via the standard double-hash construction,
+/// using Solana's built-in SHA-256 (hashv). No external crates needed.
+///
+/// HMAC(K, m) = SHA256((K' XOR opad) || SHA256((K' XOR ipad) || m))
+/// where K' = K padded to 64 bytes, ipad = 0x36, opad = 0x5C
 fn compute_roll(server_seed: &[u8; 32], message: &[u8]) -> u64 {
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(server_seed)
-        .expect("HMAC can take key of any size");
-    mac.update(message);
-    let result = mac.finalize().into_bytes();
-    // Take first 8 bytes as u64, then mod ROLL_RANGE
-    let int_val = u64::from_be_bytes(result[..8].try_into().unwrap());
+    // Build ipad and opad (64-byte blocks XORed with key)
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..32 {
+        ipad[i] ^= server_seed[i];
+        opad[i] ^= server_seed[i];
+    }
+    // inner = SHA256(ipad || message)
+    let inner = hashv(&[&ipad, message]).to_bytes();
+    // outer = SHA256(opad || inner)
+    let outer = hashv(&[&opad, &inner]).to_bytes();
+    // Take first 8 bytes as big-endian u64, mod ROLL_RANGE
+    let int_val = u64::from_be_bytes(outer[..8].try_into().unwrap());
     int_val % ROLL_RANGE
 }
 
