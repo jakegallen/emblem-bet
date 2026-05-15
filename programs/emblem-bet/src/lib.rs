@@ -74,6 +74,31 @@ pub mod emblem_bet {
         Ok(())
     }
 
+    /// Migration helper: closes an old-format GameConfig so it can be re-initialized.
+    /// Reads admin from raw bytes (offset 8-39) so it works regardless of layout version.
+    pub fn close_config(ctx: Context<CloseConfig>) -> Result<()> {
+        // Verify admin from raw bytes (offset 8..40 is admin in both old and new layout)
+        let stored_admin = {
+            let data = ctx.accounts.game_config.data.borrow();
+            require!(data.len() >= 40, EmblemBetError::Unauthorized);
+            Pubkey::try_from(&data[8..40]).map_err(|_| EmblemBetError::Unauthorized)?
+        };
+        require!(ctx.accounts.admin.key() == stored_admin, EmblemBetError::Unauthorized);
+
+        // Close: drain lamports to admin
+        let lamports = ctx.accounts.game_config.lamports();
+        **ctx.accounts.game_config.lamports.borrow_mut() = 0;
+        **ctx.accounts.admin.lamports.borrow_mut() = ctx.accounts.admin.lamports()
+            .checked_add(lamports)
+            .ok_or(EmblemBetError::Unauthorized)?;
+
+        // Zero the data (prevents account resurrection)
+        let mut data = ctx.accounts.game_config.data.borrow_mut();
+        for b in data.iter_mut() { *b = 0; }
+
+        Ok(())
+    }
+
     /// Admin: set a separate settle authority key (should be the hot server key).
     /// This separates the privileged admin key from the hot settlement key.
     pub fn set_settle_authority(
@@ -520,6 +545,20 @@ pub struct Initialize<'info> {
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct CloseConfig<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    /// CHECK: Admin verified manually in instruction body; PDA verified by seeds.
+    #[account(
+        mut,
+        seeds = [GAME_CONFIG_SEED],
+        bump,
+    )]
+    pub game_config: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
