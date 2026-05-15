@@ -99,6 +99,78 @@ pub mod emblem_bet {
         Ok(())
     }
 
+    /// Migration helper: repairs a zombie game_config (0 lamports, zeroed data, program-owned).
+    /// Called when close_config succeeded but the runtime GC left the account in a limbo state
+    /// where Initialize still fails with "account already in use".
+    /// This instruction bypasses normal Anchor validation, reallocates, funds, and writes
+    /// all GameConfig fields directly — fully replacing Initialize for the migration case.
+    pub fn repair_config(
+        ctx: Context<RepairConfig>,
+        emblem_mint: Pubkey,
+        house_edge_bps: u16,
+    ) -> Result<()> {
+        require!(
+            house_edge_bps >= MIN_HOUSE_EDGE_BPS && house_edge_bps <= MAX_HOUSE_EDGE_BPS,
+            EmblemBetError::InvalidHouseEdge
+        );
+
+        let bump = ctx.bumps.game_config;
+
+        // Compute house_vault PDA address and canonical bump
+        let (house_vault_pda, house_vault_bump) =
+            Pubkey::find_program_address(&[HOUSE_VAULT_SEED], ctx.program_id);
+
+        // Step 1: Realloc to GameConfig::SIZE (200 bytes), zero-filling any expansion
+        ctx.accounts.game_config.realloc(GameConfig::SIZE, true)?;
+
+        // Step 2: Fund to rent-exempt via system_program CPI (admin → game_config)
+        let rent = Rent::get()?;
+        let min_lamports = rent.minimum_balance(GameConfig::SIZE);
+        let current_lamports = ctx.accounts.game_config.lamports();
+        if current_lamports < min_lamports {
+            let deficit = min_lamports
+                .checked_sub(current_lamports)
+                .ok_or(EmblemBetError::Overflow)?;
+            anchor_lang::system_program::transfer(
+                CpiContext::new(
+                    ctx.accounts.system_program.to_account_info(),
+                    anchor_lang::system_program::Transfer {
+                        from: ctx.accounts.admin.to_account_info(),
+                        to: ctx.accounts.game_config.to_account_info(),
+                    },
+                ),
+                deficit,
+            )?;
+        }
+
+        // Step 3: Write all GameConfig fields directly into account data
+        let admin_key = ctx.accounts.admin.key();
+        let mut data = ctx.accounts.game_config.try_borrow_mut_data()?;
+
+        // Anchor account discriminator: sha256("account:GameConfig")[0:8]
+        data[0..8].copy_from_slice(&[45u8, 146, 146, 33, 170, 69, 96, 133]);
+        // admin (offset 8..40)
+        data[8..40].copy_from_slice(admin_key.as_ref());
+        // settle_authority = admin initially (offset 40..72); set via set_settle_authority
+        data[40..72].copy_from_slice(admin_key.as_ref());
+        // pending_admin = Pubkey::default() (offset 72..104) — zeroed by realloc
+        // emblem_mint (offset 104..136)
+        data[104..136].copy_from_slice(emblem_mint.as_ref());
+        // house_vault PDA address (offset 136..168)
+        data[136..168].copy_from_slice(house_vault_pda.as_ref());
+        // house_edge_bps little-endian (offset 168..170)
+        data[168..170].copy_from_slice(&house_edge_bps.to_le_bytes());
+        // paused: false (offset 170) — zeroed by realloc
+        // bump (offset 171)
+        data[171] = bump;
+        // house_vault_bump (offset 172)
+        data[172] = house_vault_bump;
+        // _padding (173..176), total_wagered (176..184), total_paid_out (184..192),
+        // total_bets (192..200) — all zeroed by realloc
+
+        Ok(())
+    }
+
     /// Admin: set a separate settle authority key (should be the hot server key).
     /// This separates the privileged admin key from the hot settlement key.
     pub fn set_settle_authority(
@@ -559,6 +631,23 @@ pub struct CloseConfig<'info> {
         bump,
     )]
     pub game_config: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct RepairConfig<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    /// CHECK: Zombie game_config — bypassing Anchor deserialization to repair directly.
+    /// PDA seeds verified by Anchor; signer acts as new admin.
+    #[account(
+        mut,
+        seeds = [GAME_CONFIG_SEED],
+        bump,
+    )]
+    pub game_config: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
