@@ -21,6 +21,9 @@ pub const ROLL_RANGE: u64 = 10_000;
 pub const MAX_WIN_TOKENS: u64 = 50_000 * 1_000_000_000;
 /// Minimum bet: 1 EMBLEM
 pub const MIN_BET_TOKENS: u64 = 1_000_000_000;
+/// A bet that has not been settled after this many slots can be cancelled by the player.
+/// ~150 slots ≈ 1 minute at 400ms/slot.
+pub const BET_EXPIRY_SLOTS: u64 = 150;
 /// Seed strings for PDAs
 pub const GAME_CONFIG_SEED: &[u8] = b"game_config";
 pub const HOUSE_VAULT_SEED: &[u8] = b"house_vault";
@@ -47,6 +50,10 @@ pub mod emblem_bet {
 
         let config = &mut ctx.accounts.game_config;
         config.admin = ctx.accounts.admin.key();
+        // FIX: settle_authority starts as admin; set separately via set_settle_authority
+        config.settle_authority = ctx.accounts.admin.key();
+        // FIX: pending_admin starts as default (no pending transfer)
+        config.pending_admin = Pubkey::default();
         config.emblem_mint = ctx.accounts.emblem_mint.key();
         config.house_vault = ctx.accounts.house_vault.key();
         config.house_edge_bps = house_edge_bps;
@@ -59,10 +66,24 @@ pub mod emblem_bet {
 
         emit!(GameInitialized {
             admin: config.admin,
+            settle_authority: config.settle_authority,
             emblem_mint: config.emblem_mint,
             house_edge_bps,
         });
 
+        Ok(())
+    }
+
+    /// Admin: set a separate settle authority key (should be the hot server key).
+    /// This separates the privileged admin key from the hot settlement key.
+    pub fn set_settle_authority(
+        ctx: Context<SetSettleAuthority>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        ctx.accounts.game_config.settle_authority = new_authority;
+        emit!(SettleAuthorityChanged {
+            new_authority,
+        });
         Ok(())
     }
 
@@ -106,10 +127,6 @@ pub mod emblem_bet {
         let state = &mut ctx.accounts.player_state;
         require!(state.balance >= amount, EmblemBetError::InsufficientBalance);
         require!(amount > 0, EmblemBetError::BetTooSmall);
-
-        // Ensure no pending bet
-        // (bet_request account being closed in settle prevents this naturally,
-        //  but we also check the flag for safety)
 
         // PDA signer seeds for player_vault
         let player_key = ctx.accounts.player.key();
@@ -201,7 +218,6 @@ pub mod emblem_bet {
         bet.server_seed_hash = server_seed_hash;
         bet.nonce = nonce;
         bet.slot = Clock::get()?.slot;
-        bet.settled = false;
         bet.bump = ctx.bumps.bet_request;
 
         emit!(BetRequested {
@@ -217,7 +233,7 @@ pub mod emblem_bet {
     }
 
     /// Settle a bet by revealing the server seed.
-    /// Called by the server (authority) after request_bet.
+    /// Called by the settle_authority (NOT admin) after request_bet.
     ///
     /// The program:
     /// 1. Verifies SHA-256(server_seed) == committed server_seed_hash
@@ -230,7 +246,6 @@ pub mod emblem_bet {
         server_seed: [u8; 32],
     ) -> Result<()> {
         let bet = &ctx.accounts.bet_request;
-        require!(!bet.settled, EmblemBetError::AlreadySettled);
 
         // ── Step 1: Verify server seed matches committed hash ──────────────────
         let computed_hash = sha256_hash(&server_seed);
@@ -355,6 +370,34 @@ pub mod emblem_bet {
         Ok(())
     }
 
+    /// Player: cancel an expired bet and recover locked funds.
+    /// Only callable after BET_EXPIRY_SLOTS have passed without settlement.
+    /// This protects players from server downtime or malicious non-settlement.
+    pub fn cancel_expired_bet(ctx: Context<CancelExpiredBet>) -> Result<()> {
+        let current_slot = Clock::get()?.slot;
+        let bet = &ctx.accounts.bet_request;
+
+        require!(
+            current_slot > bet.slot.checked_add(BET_EXPIRY_SLOTS).ok_or(EmblemBetError::Overflow)?,
+            EmblemBetError::BetNotExpired
+        );
+
+        // Return the locked amount to the player's balance
+        let state = &mut ctx.accounts.player_state;
+        state.balance = state.balance
+            .checked_add(bet.amount)
+            .ok_or(EmblemBetError::Overflow)?;
+
+        emit!(BetCancelled {
+            player: ctx.accounts.player.key(),
+            amount: bet.amount,
+            nonce: bet.nonce,
+        });
+
+        // bet_request account closed by constraint (close = player)
+        Ok(())
+    }
+
     /// Admin: fund the house vault from the admin's token account.
     pub fn fund_house(ctx: Context<FundHouse>, amount: u64) -> Result<()> {
         require!(amount > 0, EmblemBetError::BetTooSmall);
@@ -422,9 +465,25 @@ pub mod emblem_bet {
         Ok(())
     }
 
-    /// Admin: transfer admin authority to a new wallet (for multisig migration).
-    pub fn transfer_admin(ctx: Context<TransferAdmin>, new_admin: Pubkey) -> Result<()> {
-        ctx.accounts.game_config.admin = new_admin;
+    /// Admin: propose a new admin address. The new address must call accept_admin to confirm.
+    /// Two-step transfer prevents bricking the contract from a typo or wrong address.
+    pub fn propose_admin(ctx: Context<ProposeAdmin>, new_admin: Pubkey) -> Result<()> {
+        ctx.accounts.game_config.pending_admin = new_admin;
+        emit!(AdminTransferProposed {
+            current_admin: ctx.accounts.admin.key(),
+            proposed_admin: new_admin,
+        });
+        Ok(())
+    }
+
+    /// Proposed new admin: accept the admin transfer.
+    /// Signer must match the pending_admin set by the current admin.
+    pub fn accept_admin(ctx: Context<AcceptAdmin>) -> Result<()> {
+        let config = &mut ctx.accounts.game_config;
+        let new_admin = ctx.accounts.new_admin.key();
+        config.admin = new_admin;
+        config.pending_admin = Pubkey::default();
+        emit!(AdminTransferAccepted { new_admin });
         Ok(())
     }
 }
@@ -461,6 +520,21 @@ pub struct Initialize<'info> {
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
     pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct SetSettleAuthority<'info> {
+    #[account(
+        constraint = admin.key() == game_config.admin @ EmblemBetError::Unauthorized
+    )]
+    pub admin: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [GAME_CONFIG_SEED],
+        bump = game_config.bump,
+    )]
+    pub game_config: Account<'info, GameConfig>,
 }
 
 #[derive(Accounts)]
@@ -590,11 +664,10 @@ pub struct RequestBet<'info> {
 
 #[derive(Accounts)]
 pub struct SettleBet<'info> {
-    /// The server authority that reveals the seed and settles bets.
-    /// In MVP this is the backend server keypair.
-    /// In production, replace with Switchboard VRF oracle.
+    /// The settle authority — a dedicated hot key separate from admin.
+    /// Set via set_settle_authority after initialization.
     #[account(
-        constraint = server.key() == game_config.admin @ EmblemBetError::Unauthorized
+        constraint = server.key() == game_config.settle_authority @ EmblemBetError::Unauthorized
     )]
     pub server: Signer<'info>,
 
@@ -641,6 +714,29 @@ pub struct SettleBet<'info> {
     pub bet_request: Account<'info, BetRequest>,
 
     pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct CancelExpiredBet<'info> {
+    #[account(mut)]
+    pub player: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [PLAYER_STATE_SEED, player.key().as_ref()],
+        bump = player_state.bump,
+        constraint = player_state.wallet == player.key() @ EmblemBetError::Unauthorized,
+    )]
+    pub player_state: Account<'info, PlayerState>,
+
+    #[account(
+        mut,
+        seeds = [BET_REQUEST_SEED, player.key().as_ref()],
+        bump = bet_request.bump,
+        constraint = bet_request.player == player.key() @ EmblemBetError::Unauthorized,
+        close = player
+    )]
+    pub bet_request: Account<'info, BetRequest>,
 }
 
 #[derive(Accounts)]
@@ -717,7 +813,7 @@ pub struct AdminOnly<'info> {
 }
 
 #[derive(Accounts)]
-pub struct TransferAdmin<'info> {
+pub struct ProposeAdmin<'info> {
     #[account(
         constraint = admin.key() == game_config.admin @ EmblemBetError::Unauthorized
     )]
@@ -731,26 +827,43 @@ pub struct TransferAdmin<'info> {
     pub game_config: Account<'info, GameConfig>,
 }
 
+#[derive(Accounts)]
+pub struct AcceptAdmin<'info> {
+    #[account(
+        constraint = new_admin.key() == game_config.pending_admin @ EmblemBetError::Unauthorized
+    )]
+    pub new_admin: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [GAME_CONFIG_SEED],
+        bump = game_config.bump,
+    )]
+    pub game_config: Account<'info, GameConfig>,
+}
+
 // ─── Account Data Structures ──────────────────────────────────────────────────
 
 #[account]
 pub struct GameConfig {
-    pub admin: Pubkey,          // 32
-    pub emblem_mint: Pubkey,    // 32
-    pub house_vault: Pubkey,    // 32
-    pub house_edge_bps: u16,    // 2
-    pub paused: bool,           // 1
-    pub bump: u8,               // 1
-    pub house_vault_bump: u8,   // 1
-    pub _padding: [u8; 5],      // 5 (alignment)
-    pub total_wagered: u64,     // 8
-    pub total_paid_out: u64,    // 8
-    pub total_bets: u64,        // 8
+    pub admin: Pubkey,              // 32
+    pub settle_authority: Pubkey,   // 32 — separate hot key for bet settlement
+    pub pending_admin: Pubkey,      // 32 — two-step admin transfer
+    pub emblem_mint: Pubkey,        // 32
+    pub house_vault: Pubkey,        // 32
+    pub house_edge_bps: u16,        // 2
+    pub paused: bool,               // 1
+    pub bump: u8,                   // 1
+    pub house_vault_bump: u8,       // 1
+    pub _padding: [u8; 3],          // 3 (alignment)
+    pub total_wagered: u64,         // 8
+    pub total_paid_out: u64,        // 8
+    pub total_bets: u64,            // 8
 }
 
 impl GameConfig {
     // discriminator(8) + fields
-    pub const SIZE: usize = 8 + 32 + 32 + 32 + 2 + 1 + 1 + 1 + 5 + 8 + 8 + 8;
+    pub const SIZE: usize = 8 + 32 + 32 + 32 + 32 + 32 + 2 + 1 + 1 + 1 + 3 + 8 + 8 + 8;
 }
 
 #[account]
@@ -775,9 +888,8 @@ pub struct BetRequest {
     pub amount: u64,                // 8
     pub win_chance_bps: u16,        // 2
     pub direction: BetDirection,    // 1
-    pub settled: bool,              // 1
     pub bump: u8,                   // 1
-    pub _padding: [u8; 3],          // 3
+    pub _padding: [u8; 4],          // 4 (alignment)
     pub nonce: u64,                 // 8
     pub slot: u64,                  // 8
     pub client_seed: [u8; 32],      // 32
@@ -785,7 +897,7 @@ pub struct BetRequest {
 }
 
 impl BetRequest {
-    pub const SIZE: usize = 8 + 32 + 8 + 2 + 1 + 1 + 1 + 3 + 8 + 8 + 32 + 32;
+    pub const SIZE: usize = 8 + 32 + 8 + 2 + 1 + 1 + 4 + 8 + 8 + 32 + 32;
 }
 
 // ─── Enums ────────────────────────────────────────────────────────────────────
@@ -801,8 +913,25 @@ pub enum BetDirection {
 #[event]
 pub struct GameInitialized {
     pub admin: Pubkey,
+    pub settle_authority: Pubkey,
     pub emblem_mint: Pubkey,
     pub house_edge_bps: u16,
+}
+
+#[event]
+pub struct SettleAuthorityChanged {
+    pub new_authority: Pubkey,
+}
+
+#[event]
+pub struct AdminTransferProposed {
+    pub current_admin: Pubkey,
+    pub proposed_admin: Pubkey,
+}
+
+#[event]
+pub struct AdminTransferAccepted {
+    pub new_admin: Pubkey,
 }
 
 #[event]
@@ -843,6 +972,13 @@ pub struct BetSettled {
 }
 
 #[event]
+pub struct BetCancelled {
+    pub player: Pubkey,
+    pub amount: u64,
+    pub nonce: u64,
+}
+
+#[event]
 pub struct HouseFunded {
     pub admin: Pubkey,
     pub amount: u64,
@@ -872,8 +1008,6 @@ pub enum EmblemBetError {
     HouseInsolvent,
     #[msg("Server seed does not match committed hash")]
     InvalidServerSeed,
-    #[msg("Bet has already been settled")]
-    AlreadySettled,
     #[msg("House edge must be between 0.5% and 10%")]
     InvalidHouseEdge,
     #[msg("Arithmetic overflow")]
@@ -884,6 +1018,8 @@ pub enum EmblemBetError {
     InvalidTokenAccount,
     #[msg("Invalid mint — must be EMBLEM token")]
     InvalidMint,
+    #[msg("Bet has not yet expired — server still has time to settle")]
+    BetNotExpired,
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -916,6 +1052,13 @@ fn compute_roll(server_seed: &[u8; 32], message: &[u8]) -> u64 {
 }
 
 /// Encode a byte slice as lowercase hex string.
+/// Uses a lookup table to avoid repeated format! allocations on-chain.
 fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }
